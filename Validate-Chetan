@@ -1,0 +1,64 @@
+import json
+import boto3
+import os
+from jsonschema import validate, ValidationError  # type: ignore
+ 
+s3 = boto3.client('s3')
+glue = boto3.client('glue')
+ 
+S3_BUCKET = os.environ['S3_BUCKET']
+GLUE_JOB_NAME = "Real-Time"  # 🔁 Hardcode your Glue job name here
+ 
+# Load the schema from a local JSON file
+with open("product_schema.json") as schema_file:
+    product_schema = json.load(schema_file)
+ 
+def validate_product_data(products):
+    if not isinstance(products, list):
+        raise ValidationError("Top-level structure should be a list")
+    for product in products:
+        validate(instance=product, schema=product_schema)
+ 
+def lambda_handler(event, context):
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix='shopify/incoming/')
+    files = response.get('Contents', [])
+ 
+    if not files:
+        print("No files to process.")
+        return {"statusCode": 200, "body": "No files in incoming folder."}
+ 
+    for file in files:
+        key = file['Key']
+        if key.endswith('/'):
+            continue  # skip directories
+ 
+        print(f"Processing file: {key}")
+        try:
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+            data = json.loads(obj['Body'].read())
+ 
+            try:
+                validate_product_data(data)
+                dest_key = key.replace('incoming/', 'processed/')
+                print(f"✅ Validated. Moving to {dest_key}")
+            except ValidationError as ve:
+                dest_key = key.replace('incoming/', 'failed/')
+                print(f"❌ Validation failed: {ve.message}. Moving to {dest_key}")
+ 
+                # 👇 Start Glue job with failed file path
+                glue.start_job_run(
+                    JobName=GLUE_JOB_NAME,
+                    Arguments={
+                        '--S3_INPUT_KEY': dest_key  # 👈 Optional: Use this in your Glue script
+                    }
+                )
+                print(f"🧪 Triggered Glue job for {dest_key}")
+ 
+            # Move the file
+            s3.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': key}, Key=dest_key)
+            s3.delete_object(Bucket=S3_BUCKET, Key=key)
+ 
+        except Exception as e:
+            print(f"⚠️ Error processing {key}: {e}")
+ 
+    return {"statusCode": 200, "body": "Validation complete."}
