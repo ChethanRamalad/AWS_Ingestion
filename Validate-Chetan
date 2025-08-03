@@ -1,42 +1,66 @@
 import json
 import boto3
 import os
-from jsonschema import validate, ValidationError  # type: ignore
- 
+from jsonschema import validate, ValidationError
+
 s3 = boto3.client('s3')
 glue = boto3.client('glue')
- 
+
 S3_BUCKET = os.environ['S3_BUCKET']
-GLUE_JOB_NAME = "Real-Time"  # 🔁 Hardcode your Glue job name here
- 
-# Load the schema from a local JSON file
+glueJobName = os.environ['glueJobName']
+
+# Load schema from file
 with open("product_schema.json") as schema_file:
     product_schema = json.load(schema_file)
- 
+
 def validate_product_data(products):
     if not isinstance(products, list):
         raise ValidationError("Top-level structure should be a list")
-    for product in products:
-        validate(instance=product, schema=product_schema)
- 
+
+    cleaned_products = []
+
+    for i, product in enumerate(products):
+        cleaned = {}
+
+        # Map required fields
+        cleaned['product_id'] = product.get('id')  # Leave as int, don't cast to str
+        cleaned['title'] = product.get('title', 'Untitled')
+        cleaned['created_at'] = product.get('created_at', '')
+        cleaned['is_active'] = product.get('status', 'inactive')
+
+        # Get price from first variant
+        try:
+            cleaned['price'] = product['variants'][0]['price']
+        except (KeyError, IndexError, TypeError):
+            raise ValidationError(f"'price' is missing in variants[0] for product index {i}")
+
+        # Dummy email based on product_id
+        cleaned['email'] = f"product_{cleaned['product_id']}@example.com"
+
+        # Validate
+        validate(instance=cleaned, schema=product_schema)
+        cleaned_products.append(cleaned)
+
+    return cleaned_products
+
 def lambda_handler(event, context):
     response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix='shopify/incoming/')
     files = response.get('Contents', [])
- 
+
     if not files:
         print("No files to process.")
         return {"statusCode": 200, "body": "No files in incoming folder."}
- 
+
     for file in files:
         key = file['Key']
         if key.endswith('/'):
-            continue  # skip directories
- 
+            continue  # skip folder-like keys
+
         print(f"Processing file: {key}")
         try:
             obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
             data = json.loads(obj['Body'].read())
- 
+
             try:
                 validate_product_data(data)
                 dest_key = key.replace('incoming/', 'processed/')
@@ -44,21 +68,21 @@ def lambda_handler(event, context):
             except ValidationError as ve:
                 dest_key = key.replace('incoming/', 'failed/')
                 print(f"❌ Validation failed: {ve.message}. Moving to {dest_key}")
- 
-                # 👇 Start Glue job with failed file path
+
+                # Trigger Glue job
                 glue.start_job_run(
-                    JobName=GLUE_JOB_NAME,
+                    JobName=glueJobName,
                     Arguments={
-                        '--S3_INPUT_KEY': dest_key  # 👈 Optional: Use this in your Glue script
+                        '--S3_INPUT_KEY': dest_key
                     }
                 )
                 print(f"🧪 Triggered Glue job for {dest_key}")
- 
+
             # Move the file
             s3.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': key}, Key=dest_key)
             s3.delete_object(Bucket=S3_BUCKET, Key=key)
- 
+
         except Exception as e:
             print(f"⚠️ Error processing {key}: {e}")
- 
+
     return {"statusCode": 200, "body": "Validation complete."}
